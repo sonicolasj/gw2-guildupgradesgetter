@@ -2,6 +2,9 @@
 open Domain
 open FSharp.Collections
 open TextCopy
+open System.Text.Json
+open System.IO
+open FSharp.Data
 
 let tryParseInt (str: string) =
     match str |> Int32.TryParse with
@@ -110,7 +113,7 @@ let getGuildUpgrades apiKey (guild: Guild) lang =
 
 type ScreenState = List | Add | Remove
 
-let getUpgradesQueue availables =
+let getUpgradesQueue availables previousQueue =
     let drawList (queue: Upgrade list) (availables: Upgrade list) =
         let width, height = Console.WindowWidth, Console.WindowHeight
         let middle = width / 2
@@ -206,7 +209,7 @@ let getUpgradesQueue availables =
         printf "Which upgrade do you want to remove? "
 
     let mutable state = List
-    let mutable queue = []
+    let mutable queue = previousQueue
     let mutable availables = availables
     let mutable exit = false
     let mutable message = ""
@@ -284,19 +287,80 @@ let makeReport upgrades treasury =
 
 let copyToClipboard report = ClipboardService.SetText report
 
+type Settings = {
+    Version: string
+    Language: string
+    ApiKey: string
+    GuildId: string
+    Queue: int list
+}
+
+let saveSettings location settings =
+    let options = new JsonSerializerOptions()
+    options.WriteIndented <- true
+
+    let serializedSettings = JsonSerializer.Serialize(settings, options)
+    File.WriteAllText(location, serializedSettings)
+    ()
+
+// Source: https://fsharpforfunandprofit.com/posts/computation-expressions-intro/
+type MaybeBuilder() =
+    member this.Bind(x, f) =
+        match x with
+        | None -> None
+        | Some a -> f a
+
+    member this.Return(x) =
+        Some x
+   
+let maybe = new MaybeBuilder()
+
+let tryLoadSettings location =
+    let tryGetString propertyName (json: JsonValue) = json.TryGetProperty propertyName |> Option.map (fun prop -> prop.AsString())
+    let tryGetList propertyName (json: JsonValue) = json.TryGetProperty propertyName |> Option.map (fun prop -> [ for value in prop do yield value ])
+
+    if File.Exists location then
+        let json = File.ReadAllText location |> JsonValue.Parse
+
+        maybe {
+            let! version = json |> tryGetString "Version"
+            let! language = json |> tryGetString "Language"
+            let! apiKey = json |> tryGetString "ApiKey"
+            let! guildId = json |> tryGetString "GuildId"
+            let! rawQueue = json |> tryGetList "Queue"
+            let queue = rawQueue |> List.map (fun value -> value.AsInteger())
+
+            return {
+                Version = version
+                Language = language
+                ApiKey = apiKey
+                GuildId = guildId
+                Queue = queue
+            }
+        }
+    else
+        None
+
 [<EntryPoint; STAThread>]
 let main argv =
-    let lang = promptForLang()
-    
-    let apiKey = promptForApiKey()
+    let saveLocation = "./settings.json"
+    let settings = tryLoadSettings saveLocation
+
+    let lang = settings |> Option.map (fun s -> s.Language) |> Option.defaultWith promptForLang
+    let apiKey = settings |> Option.map (fun s -> s.ApiKey) |> Option.defaultWith promptForApiKey
 
     let guilds = Api.getAccountGuilds apiKey lang |> Async.RunSynchronously 
 
-    let guild = promptForGuildSelection guilds
+    let guild =
+        settings |> Option.bind (fun s -> guilds |> List.tryFind (fun guild -> guild.Id = s.GuildId))
+        |> Option.defaultWith (fun () -> promptForGuildSelection guilds)
 
     let upgrades = getGuildUpgrades apiKey guild lang
+
+    let previousUpgradesQueued = settings |> Option.map (fun s -> s.Queue) |> Option.defaultValue []
+    let previousQueue, availables = upgrades.Available |> List.partition (fun upgrade -> previousUpgradesQueued |> List.contains upgrade.Id)
     
-    let queuedUpgrades = getUpgradesQueue upgrades.Available
+    let queuedUpgrades = getUpgradesQueue availables previousQueue
 
     let treasury = Api.getGuildTreasury apiKey guild.Id |> Async.RunSynchronously
 
@@ -306,6 +370,15 @@ let main argv =
     copyToClipboard report
 
     Console.Write("\nThe text has been copied to the clipboard!\nPress Enter to quit.")
+
+    saveSettings saveLocation {
+        Version = "0.1.1"
+        Language = lang
+        ApiKey = apiKey
+        GuildId = guild.Id
+        Queue = queuedUpgrades |> List.map (fun u -> u.Id)
+    }
+
     Console.ReadLine() |> ignore
 
     0
